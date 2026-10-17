@@ -1514,6 +1514,13 @@ int LibRaw::parse_tiff_ifd(INT64 base)
     case 0xc629: /* 50729, AsShotWhiteXY */
       xyz[0] = getreal(type);
       xyz[1] = getreal(type);
+      // ALPA patch(Task 8e): 原版只把 xy 放进局部 xyz(仅旧 use_cm 路径用),这里另存一份供 JNI 换算拍摄白平衡。
+      if (len >= 2)
+      {
+        tiff_ifd[ifd].dng_levels.parsedfields |= LIBRAW_DNGFM_ASSHOTWHITEXY;
+        tiff_ifd[ifd].dng_levels.asshotwhitexy[0] = float(xyz[0]);
+        tiff_ifd[ifd].dng_levels.asshotwhitexy[1] = float(xyz[1]);
+      }
       xyz[2] = 1 - xyz[0] - xyz[1];
       FORC3 xyz[c] /= LibRaw_constants::d65_white[c];
       break;

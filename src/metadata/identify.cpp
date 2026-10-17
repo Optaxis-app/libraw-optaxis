@@ -1423,6 +1423,10 @@ void LibRaw::identify_process_dng_fields()
 							    cam_xyz[c][i] +=
 							        cc[c][j] * cm[j][i]; // add AsShotXY later * xyz[i];
 						cam_xyz_coeff(cmatrix, cam_xyz);
+						// ALPA patch(Task 8e): 留下算 cmatrix 用的这组 XYZ→相机矩阵(局部变量,原版不外露),供 JNI 把 AsShotWhiteXY 换成相机中性值。
+						FORCC for (int i = 0; i < 3; i++)
+							imgdata.color.dng_levels.alpa_cam_xyz[c][i] = float(cam_xyz[c][i]);
+						imgdata.color.dng_levels.parsedfields |= LIBRAW_DNGFM_ALPA_CAMXYZ;
 					}
 				}
 			}
@@ -1550,6 +1554,14 @@ void LibRaw::identify_process_dng_fields()
 						if (fabs(imgdata.color.dng_levels.asshotneutral[c]) > 0.0001)
 							cam_mul[c] = 1 / imgdata.color.dng_levels.asshotneutral[c];
 				}
+			}
+			// ALPA patch(Task 8e): AsShotWhiteXY 照 AsShotNeutral 的取法(同一 IFD 优先、退回 IFD0)拷进 imgdata;不碰 cam_mul。
+			sidx = IFDLEVELINDEX(iifd, LIBRAW_DNGFM_ASSHOTWHITEXY);
+			if (sidx >= 0)
+			{
+				COPYARR(imgdata.color.dng_levels.asshotwhitexy,
+					tiff_ifd[sidx].dng_levels.asshotwhitexy);
+				imgdata.color.dng_levels.parsedfields |= LIBRAW_DNGFM_ASSHOTWHITEXY;
 			}
 			sidx = IFDLEVELINDEX(iifd, LIBRAW_DNGFM_BLACK);
 			if (sidx >= 0)

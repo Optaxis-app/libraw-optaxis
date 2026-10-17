@@ -267,6 +267,10 @@ typedef unsigned long long UINT64;
     float baseline_exposure;
     float LinearResponseLimit;
 	libraw_dng_rawopcode_t rawopcodes[3];
+    // ALPA patch(Task 8e):只追加、不改既有字段。asshotwhitexy 由 tiff.cpp 0xc629 填(有效位 LIBRAW_DNGFM_ASSHOTWHITEXY);
+    // alpa_cam_xyz 是 identify_process_dng_fields 按光源选定、算 cmatrix 用的那组 XYZ→相机矩阵(AB·CC·CM,有效位 LIBRAW_DNGFM_ALPA_CAMXYZ)。
+    float asshotwhitexy[2];
+    float alpa_cam_xyz[4][3];
   } libraw_dng_levels_t;
 
   typedef struct
