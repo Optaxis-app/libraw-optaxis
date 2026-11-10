@@ -51,7 +51,11 @@ int LibRaw::get_decoder_info(libraw_decoder_info_t *d_info)
   else if (load_raw == &LibRaw::jxl_dng_load_raw_placeholder)
   {
     d_info->decoder_name = "jxl_dng_load_raw_placeholder()";
-#ifndef USE_DNGSDK
+#if defined(USE_JXL)
+    // ALPA patch(JPEG XL DNG):fp_dng.cpp 接管解码,与 packed_dng_load_raw 同样经 adobe_copy_pixel 落像素 ⟹ 同一组标志
+    // (ADOBECOPYPIXEL:unpack 不把 raw_image 别名到 image,LinearRaw 三通道才写得进 image;HASCURVE:线性化表照用)
+    d_info->decoder_flags = LIBRAW_DECODER_HASCURVE | LIBRAW_DECODER_ADOBECOPYPIXEL;
+#elif !defined(USE_DNGSDK)
     d_info->decoder_flags = LIBRAW_DECODER_UNSUPPORTED_FORMAT;
 #endif
   }

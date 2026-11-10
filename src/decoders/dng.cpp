@@ -26,11 +26,13 @@ void LibRaw::vc5_dng_load_raw_placeholder()
     else
       throw LIBRAW_EXCEPTION_UNSUPPORTED_FORMAT;
 }
+#ifndef USE_JXL /* ALPA patch(JPEG XL DNG):定义 USE_JXL 时由 fp_dng.cpp 接管 */
 void LibRaw::jxl_dng_load_raw_placeholder()
 {
   // placeholder only, real decoding implemented in DNG SDK
   throw LIBRAW_EXCEPTION_UNSUPPORTED_FORMAT;
 }
+#endif
 
 void LibRaw::adobe_copy_pixel(unsigned row, unsigned col, ushort **rp)
 {

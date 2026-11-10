@@ -737,3 +737,137 @@ void LibRaw::uncompressed_fp_dng_load_raw()
     if (imgdata.rawparams.options & LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT)
         convertFloatToInt();  
 }
+
+#ifdef USE_JXL
+/* ALPA patch(JPEG XL DNG,2026-11-10)—— DNG 1.7 Compression = 52546 的分块解码,不经 Adobe DNG SDK。
+ * 原版只有 jxl_dng_load_raw_placeholder(dng.cpp,恒抛 UNSUPPORTED_FORMAT,真解码在 DNG SDK 里);本仓不带 DNG SDK,
+ * 定义 USE_JXL 时由这里接管同名函数(dng.cpp 那份改成 #ifndef USE_JXL),不改 LibRaw 头文件 / 对象布局。
+ * 解法对照 Adobe DNG SDK 1.7 dng_jxl.cpp 的解码端:不重设色彩(保持码流原始编码,raw 本就是线性)、
+ * 不转方向(KeepOrientation)、色彩平面只认 1(CFA)/ 3(LinearRaw)、整数按 UINT16 读、浮点暂不接。
+ * 与它的一处差异:这里按 DNG 头 BitsPerSample 的整数口径取值(与码流同位深时即码流原始整数),不让 libjxl 按 16 位满幅放大 ——
+ * DNG 的 BlackLevel / WhiteLevel 是按这个口径写的。像素经 adobe_copy_pixel 落进 raw_image(CFA)/ image(LinearRaw),
+ * 与 packed / lossless DNG 同一条路(线性化表 curve[] 照用)。 */
+#include <jxl/decode.h>
+
+void LibRaw::jxl_dng_load_raw_placeholder()
+{
+  int iifd = find_ifd_by_offset(libraw_internal_data.unpacker_data.data_offset);
+  if (iifd < 0 || iifd > (int)libraw_internal_data.identify_data.tiff_nifds)
+    throw LIBRAW_EXCEPTION_DECODE_RAW;
+  struct tiff_ifd_t *ifd = &tiff_ifd[iifd];
+  const unsigned samples = (unsigned)ifd->samples;
+  if (samples != 1 && samples != 3)
+    throw LIBRAW_EXCEPTION_DECODE_RAW;
+  if (libraw_internal_data.unpacker_data.tiff_samples != samples)
+    throw LIBRAW_EXCEPTION_DECODE_RAW;
+  if (ifd->sample_format == 3)
+    throw LIBRAW_EXCEPTION_UNSUPPORTED_FORMAT; // 浮点 JXL DNG 暂不接(手机 / 相机未见)
+  // DNG 头声明的位深:BlackLevel / WhiteLevel / 线性化表都按它的整数口径写。码流位深与它不同时(写入端把 12 位数据
+  // 标成 16 位 DNG,或反过来),按 DNG 的位深取值(JXL_BIT_DEPTH_CUSTOM,libjxl 按比例换算),而不是按码流原样 ——
+  // 否则整张图按 2^(差) 倍错亮 / 错暗且不报错(复读 P2)。相等时与按码流原样取逐位相同。
+  const unsigned dngBits = (unsigned)ifd->bps;
+  if (dngBits < 1 || dngBits > 16)
+    throw LIBRAW_EXCEPTION_DECODE_RAW;
+
+  tile_stripe_data_t tiles;
+  tiles.init(ifd, imgdata.sizes, libraw_internal_data.unpacker_data, libraw_internal_data.unpacker_data.order,
+             libraw_internal_data.internal_data.input);
+  if (tiles.tBytes.size() < 1)
+    throw LIBRAW_EXCEPTION_IO_CORRUPT;
+  const INT64 memLimit = INT64(imgdata.rawparams.max_raw_memory_mb) * 1024LL * 1024LL;
+  if (tiles.maxBytesInTile <= 0 || tiles.maxBytesInTile > memLimit || tiles.maxBytesInTile >= (1LL << 31))
+    throw LIBRAW_EXCEPTION_TOOBIG;
+  const INT64 tilePixelBytes = INT64(tiles.tileWidth) * INT64(tiles.tileHeight) * INT64(samples) * 2;
+  if (tilePixelBytes <= 0 || tilePixelBytes > memLimit)
+    throw LIBRAW_EXCEPTION_TOOBIG;
+
+  std::vector<uchar> cBuffer((size_t)tiles.maxBytesInTile);
+  std::vector<ushort> pix;
+  JxlDecoder *dec = JxlDecoderCreate(NULL);
+  if (!dec)
+    throw LIBRAW_EXCEPTION_ALLOC;
+  try
+  {
+    for (unsigned y = 0, t = 0; y < tiles.tilesV; y++)
+    {
+      for (unsigned x = 0; x < tiles.tilesH; x++, t++)
+      {
+        checkCancel();
+        if (tiles.tBytes[t] <= 0 || tiles.tBytes[t] > tiles.maxBytesInTile)
+          throw LIBRAW_EXCEPTION_IO_CORRUPT;
+        libraw_internal_data.internal_data.input->seek(tiles.tOffsets[t], SEEK_SET);
+        if (libraw_internal_data.internal_data.input->read(cBuffer.data(), 1, (size_t)tiles.tBytes[t]) != tiles.tBytes[t])
+          throw LIBRAW_EXCEPTION_IO_EOF;
+
+        JxlDecoderReset(dec);
+        if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS ||
+            JxlDecoderSetKeepOrientation(dec, JXL_TRUE) != JXL_DEC_SUCCESS ||
+            JxlDecoderSetInput(dec, cBuffer.data(), (size_t)tiles.tBytes[t]) != JXL_DEC_SUCCESS)
+          throw LIBRAW_EXCEPTION_DECODE_RAW;
+        JxlDecoderCloseInput(dec);
+
+        JxlBasicInfo info;
+        const JxlPixelFormat fmt = {samples, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
+        bool haveInfo = false, done = false;
+        while (!done)
+        {
+          switch (JxlDecoderProcessInput(dec))
+          {
+          case JXL_DEC_BASIC_INFO:
+            if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS)
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            // 平面数必须等于 DNG 的 SamplesPerPixel;不认浮点 / > 16 位整数;一块不能大于 TileWidth × TileLength
+            if (info.num_color_channels != samples || info.exponent_bits_per_sample != 0 ||
+                info.bits_per_sample < 1 || info.bits_per_sample > 16 ||
+                info.xsize < 1 || info.ysize < 1 || info.xsize > tiles.tileWidth || info.ysize > tiles.tileHeight)
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            haveInfo = true;
+            break;
+          case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+          {
+            if (!haveInfo)
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            // 位深须在设好输出缓冲之后再设(libjxl decode.h:JxlDecoderSetImageOutBitDepth 的调用约束)
+            const JxlBitDepth depth = info.bits_per_sample == dngBits
+                                          ? JxlBitDepth{JXL_BIT_DEPTH_FROM_CODESTREAM, 0, 0}
+                                          : JxlBitDepth{JXL_BIT_DEPTH_CUSTOM, dngBits, 0};
+            size_t need = 0;
+            if (JxlDecoderImageOutBufferSize(dec, &fmt, &need) != JXL_DEC_SUCCESS ||
+                need != size_t(info.xsize) * info.ysize * samples * 2)
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            pix.resize(need / 2);
+            if (JxlDecoderSetImageOutBuffer(dec, &fmt, pix.data(), need) != JXL_DEC_SUCCESS ||
+                JxlDecoderSetImageOutBitDepth(dec, &depth) != JXL_DEC_SUCCESS)
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            break;
+          }
+          case JXL_DEC_FULL_IMAGE:
+            done = true; // 一块只取第一帧
+            break;
+          case JXL_DEC_SUCCESS:
+            if (!haveInfo || pix.empty())
+              throw LIBRAW_EXCEPTION_DECODE_RAW;
+            done = true;
+            break;
+          default: // JXL_DEC_ERROR / NEED_MORE_INPUT(输入已关)/ 其它
+            throw LIBRAW_EXCEPTION_DECODE_RAW;
+          }
+        }
+        const unsigned row0 = y * tiles.tileHeight, col0 = x * tiles.tileWidth;
+        for (unsigned r = 0; r < info.ysize && row0 + r < imgdata.sizes.raw_height; r++)
+        {
+          ushort *rp = pix.data() + size_t(r) * info.xsize * samples;
+          for (unsigned c = 0; c < info.xsize && col0 + c < imgdata.sizes.raw_width; c++)
+            adobe_copy_pixel(row0 + r, col0 + c, &rp);
+        }
+      }
+    }
+  }
+  catch (...)
+  {
+    JxlDecoderDestroy(dec);
+    throw;
+  }
+  JxlDecoderDestroy(dec);
+}
+#endif

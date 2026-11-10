@@ -17,6 +17,7 @@
  */
 
 #include "../../internal/dcraw_defs.h"
+#include <vector>
 
 inline uint32_t abs32(int32_t x)
 {
@@ -161,36 +162,63 @@ void LibRaw::phase_one_flat_field(int is_float, int nc)
     if (y == 0)
       continue;
     rend = head[1] + y * head[5];
-    for (row = rend - head[5];
-         row < raw_height && row < rend && row < unsigned(head[1] + head[3] - head[5]);
-         row++)
+    const unsigned rstart = rend - head[5];
+    unsigned rstop = rstart;
+    while (rstop < raw_height && rstop < rend && rstop < unsigned(head[1] + head[3] - head[5]))
+      rstop++;
+    // ALPA patch(IIQ 并行,2026-10-24 → 2026-10-29 改成按网格带):原版逐行串行、行内各网格列互不依赖。
+    // 10-24 版在每一行里开一次并行区(一张 IQ4 是 1 万多行 × 两次平场),fork/join 吃掉了收益:
+    // arm64 Mac 上 1 线程与 4 线程同为约 2.2 s。改后 S26 Ultra 实测(IQ4 150MP 半尺寸,4 线程)
+    // open 到 scale_colors 之前 0.63–0.69 s → 0.58 s,整次 LibRaw 约 1.08 s → 0.98 s。
+    // 现在每个网格带只开一次:每个格列 xi 在本带所有行上独立推进,它读的两列 mrow(xi-1、xi)
+    // 在线程内用本地副本按原顺序做同样的 m += d;带结束后再由主线程对 mrow 做同样次数的累加。
+    // 每个像素的算式、乘子与浮点累加顺序都与原版相同 ⟹ 逐位一致(Phase One 两张真样张输出哈希对拍过)。
+#if defined(LIBRAW_USE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int xi = 1; xi < int(wide); xi++)
     {
-      for (x = 1; x < wide; x++)
+      float m0[4], d0[4], m1[4], d1[4], lmult[4];
+      unsigned lc, lcol, lrow;
+      for (lc = 0; lc < (unsigned)nc; lc += 2)
       {
-        for (c = 0; c < (unsigned)nc; c += 2)
+        m0[lc] = mrow[lc * wide + xi - 1];
+        d0[lc] = mrow[(lc + 1) * wide + xi - 1];
+        m1[lc] = mrow[lc * wide + xi];
+        d1[lc] = mrow[(lc + 1) * wide + xi];
+      }
+      const unsigned lcend = head[0] + xi * head[4];
+      for (lrow = rstart; lrow < rstop; lrow++)
+      {
+        for (lc = 0; lc < (unsigned)nc; lc += 2)
         {
-          mult[c] = mrow[c * wide + x - 1];
-          mult[c + 1] = (mrow[c * wide + x] - mult[c]) / head[4];
+          lmult[lc] = m0[lc];
+          lmult[lc + 1] = (m1[lc] - lmult[lc]) / head[4];
         }
-        cend = head[0] + x * head[4];
-        for (col = cend - head[4];
-             col < raw_width && col < cend && col < unsigned(head[0] + head[2] - head[4]);
-             col++)
+        for (lcol = lcend - head[4];
+             lcol < raw_width && lcol < lcend && lcol < unsigned(head[0] + head[2] - head[4]);
+             lcol++)
         {
-          c = nc > 2 ? FC(row - top_margin, col - left_margin) : 0;
-          if (!(c & 1))
+          lc = nc > 2 ? FC(lrow - top_margin, lcol - left_margin) : 0;
+          if (!(lc & 1))
           {
-            c = unsigned(RAW(row, col) * mult[c]);
-            RAW(row, col) = LIM(c, 0, 65535);
+            lc = unsigned(RAW(lrow, lcol) * lmult[lc]);
+            RAW(lrow, lcol) = LIM(lc, 0, 65535);
           }
-          for (c = 0; c < (unsigned)nc; c += 2)
-            mult[c] += mult[c + 1];
+          for (lc = 0; lc < (unsigned)nc; lc += 2)
+            lmult[lc] += lmult[lc + 1];
+        }
+        for (lc = 0; lc < (unsigned)nc; lc += 2)
+        {
+          m0[lc] += d0[lc];
+          m1[lc] += d1[lc];
         }
       }
+    }
+    for (row = rstart; row < rstop; row++)
       for (x = 0; x < wide; x++)
         for (c = 0; c < (unsigned)nc; c += 2)
           mrow[c * wide + x] += mrow[(c + 1) * wide + x];
-    }
   }
   free(mrow);
 }
@@ -634,6 +662,120 @@ unsigned LibRaw::ph1_bithuff(int nbits, ushort *huff)
 #endif
 }
 
+// ALPA patch(IIQ 并行解压,2026-10-24):见 phase_one_load_raw_c 里的调用处。成功 ⟹ true(raw_image 已填好);否则 false,调用方走原串行路径。
+bool LibRaw::alpa_phase_one_load_raw_c_parallel(const int *offset, const int *length)
+{
+  INT64 bytes = 0;
+  const unsigned char *mem = libraw_internal_data.internal_data.input->alpa_memory(&bytes);
+  if (!mem || bytes <= 0 || !raw_image)
+    return false;
+  const INT64 base = INT64(data_offset);
+  const short ord = order;
+  const int fmt = ph1.format;
+  const int rw = raw_width, rh = raw_height;
+  ushort *raw = raw_image;
+  const ushort *crv = curve;
+  // 原版 len 是函数级变量、跨行延续(复读 r1 P1)。按行解一行:inLen / inKnown = 行首的 len 及其是否已知,outLen = 行末的 len。
+  // 返回 0 = 成功;1 = 越界 / 校验失败(整段交回原串行路径);2 = 行首遇到「长度不变」而 len 不可知(留到第二遍按行序带着上一行的 len 补解)。
+  enum { ROW_OK = 0, ROW_BAD = 1, ROW_NEEDS_CARRY = 2 };
+  auto decodeRow = [&](int row, const int inLen[2], bool inKnown, int outLen[2]) -> int {
+    INT64 pos = base + offset[row];
+    UINT64 bitbuf = 0;
+    int vbits = 0, rowbad = 0;
+    auto bits = [&](int n) -> unsigned {
+      if (n == 0)
+        return 0;
+      if (vbits < n)
+      {
+        uchar s4[4] = {0xff, 0xff, 0xff, 0xff};
+        if (pos < 0 || pos + 4 > bytes)
+          rowbad = 1; // 原版此处读到 EOF:交给串行路径按原语义处理
+        else
+          memcpy(s4, mem + pos, 4);
+        pos += 4;
+        bitbuf = bitbuf << 32 | libraw_sget4_static(ord, s4);
+        vbits += 32;
+      }
+      unsigned c = unsigned((bitbuf << (64 - vbits) >> (64 - n)) & 0xffffffff);
+      vbits -= n;
+      return c;
+    };
+    int len[2] = {inLen[0], inLen[1]}, pred[2] = {0, 0}, i, j;
+    bool known[2] = {inKnown, inKnown};
+    ushort *dst = raw + size_t(row) * rw;
+    for (int col = 0; col < rw; col++)
+    {
+      if (col >= (rw & -8))
+        len[0] = len[1] = 14;
+      else if ((col & 7) == 0)
+        for (i = 0; i < 2; i++)
+        {
+          for (j = 0; j < 5 && !bits(1); j++)
+            ;
+          if (j--)
+          {
+            len[i] = length[j * 2 + bits(1)];
+            known[i] = true;
+          }
+          else if (!known[i])
+            return ROW_NEEDS_CARRY;
+        }
+      if (rowbad)
+        return ROW_BAD;
+      ushort px;
+      if ((i = len[col & 1]) == 14)
+        px = ushort(pred[col & 1] = bits(16));
+      else
+        px = ushort(pred[col & 1] += bits(i) + 1 - (1 << (i - 1)));
+      if (rowbad || (pred[col & 1] >> 16))
+        return ROW_BAD;
+      if (fmt == 5 && px < 256)
+        px = crv[px];
+      dst[col] = fmt == 8 ? px : ushort(px << 2);
+    }
+    outLen[0] = len[0];
+    outLen[1] = len[1];
+    return ROW_OK;
+  };
+
+  // 宽度不是 8 的倍数:上一行末尾必定落在 col >= rw & -8 那段,len 恒为 {14,14} ⟹ 第 1 行起行首 len 已知。
+  // 第 0 行在原版里是未初始化值:那里遇到「长度不变」就整段交回原串行路径(行为与原版一致)。
+  const bool tailFixed = (rw & 7) != 0;
+  const int fixedLen[2] = {14, 14};
+  std::vector<int> endLen(size_t(rh) * 2, 0);
+  std::vector<unsigned char> status(rh, ROW_OK);
+  int bad = 0;
+  const int CHUNK = 64;
+  for (int r0 = 0; r0 < rh && !bad; r0 += CHUNK)
+  {
+    checkCancel();
+    const int r1 = MIN(rh, r0 + CHUNK);
+#if defined(LIBRAW_USE_OPENMP)
+#pragma omp parallel for schedule(dynamic, 1) reduction(| : bad)
+#endif
+    for (int row = r0; row < r1; row++)
+    {
+      const int st = decodeRow(row, fixedLen, row > 0 && tailFixed, &endLen[size_t(row) * 2]);
+      status[row] = (unsigned char)st;
+      if (st == ROW_BAD || (st == ROW_NEEDS_CARRY && row == 0))
+        bad = 1;
+    }
+  }
+  if (bad)
+    return false;
+  // 第二遍(复读 r2 P3):只补解行首依赖上一行 len 的那些行,按行序串行,上一行的行末 len 此时已确定;其余行的并行结果保留。
+  for (int row = 1; row < rh; row++)
+  {
+    if (status[row] != ROW_NEEDS_CARRY)
+      continue;
+    if ((row & 63) == 0)
+      checkCancel();
+    if (decodeRow(row, &endLen[size_t(row - 1) * 2], true, &endLen[size_t(row) * 2]) != ROW_OK)
+      return false;
+  }
+  return true;
+}
+
 void LibRaw::phase_one_load_raw_c()
 {
   static const int length[] = {8, 7, 6, 9, 11, 10, 5, 12, 14, 13};
@@ -672,8 +814,17 @@ void LibRaw::phase_one_load_raw_c()
 
   for (i = 0; i < 256; i++)
     curve[i] = ushort(float(i * i) / 3.969f + 0.5f);
+  // ALPA patch(IIQ 并行解压,2026-10-24):每行有独立偏移 ⟹ 数据在内存里时按行并行直读(位读取器线程局部,取数同 ph1_bithuff / get4)。
+  // 任一行越出数据或校验失败(pred 溢出)⟹ 整段丢弃并行结果、退回下面的原串行循环,保证合法文件逐位一致、坏文件行为与原版相同。
   try
   {
+    // 在 try 里调:并行段的 checkCancel 抛出时同样走下面的 catch 释放 pixel(复读 r1 P2)
+    if (alpa_phase_one_load_raw_c_parallel(offset, length))
+    {
+      free(pixel);
+      maximum = 0xfffc - ph1.t_black;
+      return;
+    }
     for (row = 0; row < raw_height; row++)
     {
       checkCancel();

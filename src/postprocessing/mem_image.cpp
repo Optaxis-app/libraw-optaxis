@@ -221,17 +221,27 @@ int LibRaw::copy_mem_image(void *scan0, int stride, int bgr)
 
   if (S.flip & 4)
     SWAP(S.height, S.width);
-  uchar *ppm;
-  ushort *ppm2;
-  int c, row, col, soff, rstep, cstep;
+  int soff, rstep, cstep;
 
   soff = flip_index(0, 0);
   cstep = flip_index(0, 1) - soff;
   rstep = flip_index(1, 0) - flip_index(0, S.width);
 
-  for (row = 0; row < S.height; row++, soff += rstep)
+  // ALPA patch(IIQ 并行,2026-10-24):每行起点 = soff0 + row·(rstep + width·cstep)(原版逐行累加的同一个数)⟹ 按行并行,逐位不变。
+  // 1.5 亿像素全尺寸导出时这步单线程约 6 秒。
+  const INT64 soff0 = soff;
+  const INT64 rowAdvance = INT64(rstep) + INT64(S.width) * INT64(cstep);
+  const int outH = S.height;
+#if defined(LIBRAW_USE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (int row = 0; row < outH; row++)
   {
     uchar *bufp = ((uchar *)scan0) + size_t(row) * size_t(stride);
+    uchar *ppm;
+    ushort *ppm2;
+    int c, col;
+    int soff = int(soff0 + INT64(row) * rowAdvance);
     ppm2 = (ushort *)(ppm = bufp);
     // keep trivial decisions in the outer loop for speed
     if (bgr)
@@ -261,7 +271,6 @@ int LibRaw::copy_mem_image(void *scan0, int stride, int bgr)
       }
     }
 
-    //            bufp += stride;           // go to the next line
   }
 
   S.iheight = s_iheight;

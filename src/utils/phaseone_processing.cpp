@@ -17,6 +17,7 @@
  */
 
 #include "../../internal/libraw_cxx_defs.h"
+#include "alpa_phaseone_black.h"
 
 
 void LibRaw::phase_one_allocate_tempbuffer()
@@ -37,6 +38,8 @@ void LibRaw::phase_one_free_tempbuffer()
 		imgdata.rawdata.raw_alloc = 0;
 }
 
+// ALPA patch(暗场降噪 IIQ 黑电平,2026-11-07):判据与来由见同目录 alpa_phaseone_black.h(与 macOS 转换器共用一份)。
+
 int LibRaw::phase_one_subtract_black(ushort *src, ushort *dest)
 {
 
@@ -46,9 +49,11 @@ int LibRaw::phase_one_subtract_black(ushort *src, ushort *dest)
         O.user_cblack[1] <= -1000000 && O.user_cblack[2] <= -1000000 &&
         O.user_cblack[3] <= -1000000)
     {
+      const int alpaBlack = alpa_p1_measured_black(src, S.raw_width, S.raw_height, S.top_margin, S.left_margin,
+                                                   S.width, S.height, imgdata.color.phase_one_data.t_black);
       if (!imgdata.rawdata.ph1_cblack || !imgdata.rawdata.ph1_rblack)
       {
-        int bl = imgdata.color.phase_one_data.t_black;
+        int bl = alpaBlack;
         for (int row = 0; row < S.raw_height; row++)
         {
           checkCancel();
@@ -62,10 +67,17 @@ int LibRaw::phase_one_subtract_black(ushort *src, ushort *dest)
       }
       else
       {
-        int bl = imgdata.color.phase_one_data.t_black;
-        for (int row = 0; row < S.raw_height; row++)
+        int bl = alpaBlack;
+        // ALPA patch(IIQ 并行,2026-10-24):逐像素独立 ⟹ 按 64 行一块检查取消、块内按行并行;结果逐位一致。
+        for (int r0 = 0; r0 < S.raw_height; r0 += 64)
         {
           checkCancel();
+          const int r1 = MIN(int(S.raw_height), r0 + 64);
+#if defined(LIBRAW_USE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (int row = r0; row < r1; row++)
+        {
           for (int col = 0; col < S.raw_width; col++)
           {
             int idx = row * S.raw_width + col;
@@ -79,6 +91,7 @@ int LibRaw::phase_one_subtract_black(ushort *src, ushort *dest)
                                                 .split_row];
             dest[idx] = val > 0 ? val : 0;
           }
+        }
         }
       }
     }

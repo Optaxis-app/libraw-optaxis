@@ -126,7 +126,9 @@ enum LibRaw_dngfields_marks
   LIBRAW_DNGFM_LINEARRESPONSELIMIT = 1 << 14,
   LIBRAW_DNGFM_USERCROP = 1 << 15,
   LIBRAW_DNGFM_OPCODE1 = 1 << 16,
-  LIBRAW_DNGFM_OPCODE3 = 1 << 17
+  LIBRAW_DNGFM_OPCODE3 = 1 << 17,
+  LIBRAW_DNGFM_ASSHOTWHITEXY = 1 << 18, // ALPA patch(Task 8e): AsShotWhiteXY 已解析进 dng_levels.asshotwhitexy
+  LIBRAW_DNGFM_ALPA_CAMXYZ = 1 << 19    // ALPA patch(Task 8e): dng_levels.alpa_cam_xyz 存了 identify 选定的 XYZ→相机矩阵
 };
 
 enum LibRaw_As_Shot_WB_Applied_codes

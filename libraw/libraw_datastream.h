@@ -114,6 +114,8 @@ public:
    * OpenMP is not used */
   virtual int lock() { return 1; } /* success */
   virtual void unlock() {}
+  /* ALPA patch(IIQ 并行解压,2026-10-24):整份数据已在内存里的流交出只读指针,供解码器按偏移并行直读;其余流返回 NULL(走原串行路径)。 */
+  virtual const unsigned char *alpa_memory(INT64 *bytes) { (void)bytes; return NULL; }
   virtual const char *fname() { return NULL; };
 #ifdef LIBRAW_WIN32_UNICODEPATHS
   virtual const wchar_t *wfname() { return NULL; };
@@ -284,6 +286,8 @@ public:
     if (streampos >= streamsize)   return -1;
     return buf[streampos++];
   }
+  /* ALPA patch(IIQ 并行解压,2026-10-24) */
+  virtual const unsigned char *alpa_memory(INT64 *bytes) { *bytes = (INT64)streamsize; return buf; }
 
 private:
   unsigned char *buf;

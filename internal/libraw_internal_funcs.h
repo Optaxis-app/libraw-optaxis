@@ -220,6 +220,7 @@ it under the terms of the one of two licenses as you choose:
 	void        phase_one_load_raw();
 	unsigned    ph1_bits (int nbits);
 	void        phase_one_load_raw_c();
+	bool        alpa_phase_one_load_raw_c_parallel(const int *offset, const int *length); // ALPA patch(IIQ 并行解压,2026-10-24)
     void		phase_one_load_raw_s();
 	void        hasselblad_load_raw();
 	void        leaf_hdr_load_raw();
